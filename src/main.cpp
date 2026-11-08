@@ -1,201 +1,541 @@
+
 #include <Arduino.h>
-#include <DHT.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_ADXL345_U.h>
+#include <math.h>
+#include <stdio.h>
 
-// Sensor Pins // Broches des capteurs
-#define TRIG_PIN 5
-#define ECHO_PIN 18
-#define DHT_PIN 15
-#define DHT_TYPE DHT11
+// =====================================================
+// 1. CONFIGURATION DU CAPTEUR ADXL345
+// =====================================================
 
-DHT dht(DHT_PIN, DHT_TYPE);
+#define SDA_PIN 21
+#define SCL_PIN 22
+#define ADXL345_ADDRESS 0x53
 
-// Type of measurement sent to the queue // Type de mesure envoyée dans la queue
-enum TypeCapteur : uint8_t {
-    ULTRASON,
-    TEMPERATURE_HUMIDITE
+Adafruit_ADXL345_Unified accel =Adafruit_ADXL345_Unified(12345);
+
+// =====================================================
+// 2. CONFIGURATION WIFI
+// =====================================================
+
+const char* ssid = "DIGIFIBRA-efF3";
+const char* password = "zS{&Tb|)4bC|";
+
+// =====================================================
+// 3. CONFIGURATION MQTT
+// =====================================================
+
+const char* mqtt_server = "broker.hivemq.com";
+const int mqtt_port = 1883;
+
+const char* topic = "tp/esp32/mpu6050/orientation/test-esp32-6842";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// =====================================================
+// 4. ORIENTATIONS ET STRUCTURE DES MESSAGES
+// =====================================================
+
+// orientacíon
+enum Orientation : uint8_t {
+    UP,
+    DOWN,
+    LEFT,
+    RIGHT
 };
 
-// Message passed between tasks // Message transmis entre les tâches
-struct Mesure {
-    uint32_t tempsMs;
-    TypeCapteur type;
-    float distance;
-    float temperature;
-    float humidite;
+// orientacíon, acceleracíon x, accelaration y, accelaration z
+struct MessageOrientation {
+    Orientation orientation;
+    float ax;
+    float ay;
+    float az;
 };
 
-//  Queue shared among tasks //Queue partagée entre les tâches
-QueueHandle_t fileMesures = nullptr;
+// =====================================================
+// 5. VARIABLES GLOBALES
+// =====================================================
 
-// Task 1: Ultrasonic Sensor //Tâche 1 : capteur ultrasonique
-void tacheUltrason(void *parameter) {
-    pinMode(TRIG_PIN, OUTPUT); // ici on etablie une communication entre Esp et le capteur.et out pour que l esp puisse lui permetrre de recevoir les donn'ees
-    pinMode(ECHO_PIN, INPUT); // configure le role de la broche(pin mode) l'esp 32 doit lire le signal entrant
-    digitalWrite(TRIG_PIN, LOW);
+QueueHandle_t fileOrientations = nullptr;
 
-    while (true) {
-        digitalWrite(TRIG_PIN, LOW);
-        delayMicroseconds(2);
-        digitalWrite(TRIG_PIN, HIGH);
-        delayMicroseconds(10);
-        digitalWrite(TRIG_PIN, LOW);
+Orientation derniereOrientation = UP;
+bool premiereMesure = true;
 
-        unsigned long duree = pulseIn(ECHO_PIN, HIGH, 30000);
+// Compteurs d'erreurs //Contadores de errores
+uint32_t nombreMessagesPerdus = 0;
+uint32_t nombreErreursCapteur = 0;
+uint32_t nombreErreursPublication = 0;
+uint32_t nombreTentativesWiFi = 0;
+uint32_t nombreTentativesMQTT = 0;
 
-        if (duree != 0) {
-            Mesure m = {};
-            m.tempsMs = millis();
-            m.type = ULTRASON;
-            m.distance = duree * 0.0343f / 2.0f;
+// Délais de reconnexion //Plazos de reconexión
+const unsigned long DELAI_WIFI = 10000;
+const unsigned long DELAI_MQTT = 5000;
 
-            // Send the measurement to the queue // Envoyer la mesure dans la queue  
-            xQueueSend(fileMesures, &m, 0);
-        }
+unsigned long derniereTentativeWiFi = 0;
+unsigned long derniereTentativeMQTT = 0;
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+// =====================================================
+// 6. CONVERSION DE L'ORIENTATION EN TEXTE
+// =====================================================
+
+//convertir un valor de orientación en texto
+const char* nomOrientation(Orientation orientation) {
+
+    switch (orientation) {
+
+        case UP:
+            return "UP";
+
+        case DOWN:
+            return "DOWN";
+
+        case LEFT:
+            return "LEFT";
+
+        case RIGHT:
+            return "RIGHT";
+
+        default:
+            return "UNKNOWN";
     }
 }
 
-// Task 2: DHT11 Sensor // Tâche 2 : capteur DHT11 
-void tacheDHT(void *parameter) {
-    dht.begin();
+// =====================================================
+// 7. VERIFICATION DE LA PRESENCE DU CAPTEUR I2C
+// =====================================================
 
-    while (true) {
-        float temperature = dht.readTemperature();
-        float humidite = dht.readHumidity();
+// Comprobar si el sensor ADXL345 se detecta correctamente y se comunica con el ESP32 a través del bus I2C.
+bool capteurPresent() {
 
-        if (!isnan(temperature) && !isnan(humidite)) {
-            Mesure m = {};
-            m.tempsMs = millis();
-            m.type = TEMPERATURE_HUMIDITE;
-            m.temperature = temperature;
-            m.humidite = humidite;
+    Wire.beginTransmission(ADXL345_ADDRESS);
 
-            // Send the measurement to the queue //Envoyer la mesure dans la queue
-            xQueueSend(fileMesures, &m, 0);
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
+    return Wire.endTransmission() == 0;
 }
 
-// Task 3: Serial Communication and Local Storage // Tâche 3 : communication série et stockage local 
+// =====================================================
+// 8. LECTURE DE L'ACCELEROMETRE
+// =====================================================
 
-void tacheCommunication(void *parameter) {
-    static Mesure historique[100];
-    size_t nombreMesures = 0;
-    size_t prochainePosition = 0;
-    String commande = "";
+//Leer los tres valores de aceleración (X, Y y Z) del sensor ADXL345 y, a continuación, comprobar si los valores obtenidos son correctos.
+bool lireAccelerometre(float &ax, float &ay, float &az) {
 
-    Serial.println("Available Commands :");
-    Serial.println("csv: Export measurements");
-    Serial.println("help: display commands");
+    // Vérifier que le capteur répond sur le bus I2C
+    if (!capteurPresent()) {
+        return false;
+    }
+
+    //créer une variable appelée event qui va recevoir les informations mesurées par le capteur ADXL345
+    sensors_event_t event;
+
+    // Lecture des accélérations
+    //Cette instruction demande à la bibliothèque de récupérer les mesures du capteur ADXL345.
+    accel.getEvent(&event);
+
+    ax = event.acceleration.x;
+    ay = event.acceleration.y;
+    az = event.acceleration.z;
+
+    // Vérifier que les valeurs sont exploitables
+    if (!isfinite(ax) || !isfinite(ay) || !isfinite(az)) {
+        return false;
+    }
+
+    return true;
+}
+
+// =====================================================
+// 9. DETECTION DE L'ORIENTATION
+// =====================================================
+
+// Retourne true si une orientation nette est détectée.
+// Sinon retourne false : l'orientation précédente est conservée.
+/*bool detecterOrientation(float ax, float ay, float az,Orientation &orientation) {
+
+    const float seuil = 7.0f;
+
+    // Axe Z dominant
+    if (fabsf(az) >= fabsf(ax) && fabsf(az) >= fabsf(ay) && fabsf(az) > seuil) {
+        orientation = (az > 0) ? UP : DOWN;
+        return true;
+    }
+
+    // Axe X dominant
+    if (fabsf(ax) >= fabsf(ay) &&
+        fabsf(ax) >= fabsf(az) &&
+        fabsf(ax) > seuil) {
+
+        orientation = (ax > 0) ? RIGHT : LEFT;
+        return true;
+    }
+
+    // Aucune orientation nette
+    return false;
+}*/
+
+bool detecterOrientation(float ax, float ay, float az, Orientation &orientation) {
+
+    const float seuil = 7.0f;
+
+    // Si Z est l'axe dominant
+    if (fabsf(az) > seuil && fabsf(az) >= fabsf(ax) && fabsf(az) >= fabsf(ay)) {
+        if (az > 0) {
+            orientation = UP;
+        } else {
+            orientation = DOWN;
+        }
+        return true;
+    }
+
+    // Si X est l'axe dominant
+    if (fabsf(ax) > seuil && fabsf(ax) >= fabsf(ay) && fabsf(ax) >= fabsf(az)) {
+        if (ax > 0) {
+            orientation = RIGHT;
+        } else {
+            orientation = LEFT;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// =====================================================
+// 10. TACHE FREERTOS : LECTURE DU CAPTEUR
+// =====================================================
+
+void tacheCapteur(void *parameter) {
+
+    float ax, ay, az;
+
+    uint8_t erreursConsecutives = 0;
 
     while (true) {
-        Mesure m;
 
-        if (xQueueReceive(fileMesures, &m, pdMS_TO_TICKS(100)) == pdPASS) {
-            historique[prochainePosition] = m;
-            prochainePosition = (prochainePosition + 1) % 100;
+        // Lire le capteur
+        if (!lireAccelerometre(ax, ay, az)) {
 
-            if (nombreMesures < 100) {
-                nombreMesures++;
+            nombreErreursCapteur++;
+            erreursConsecutives++;
+
+            Serial.println("[ERREUR] Lecture ADXL345 impossible !");
+
+            Serial.print("[CAPTEUR] Nombre d'erreurs : ");
+            Serial.println(nombreErreursCapteur);
+
+            // Après plusieurs échecs, tenter de réinitialiser
+            if (erreursConsecutives >= 5) {
+
+                Serial.println( "[CAPTEUR] Tentative de reinitialisation..." );
+
+                if (accel.begin()) {
+
+                    accel.setRange(ADXL345_RANGE_2_G);
+
+                    Serial.println( "[CAPTEUR] ADXL345 reinitialise !" );
+
+                } else {
+
+                    Serial.println("[CAPTEUR] Reinitialisation impossible !");
+                }
+
+                erreursConsecutives = 0;
             }
 
-            if (m.type == ULTRASON) {
-                Serial.print("[HC-SR04] ");
-                Serial.print(m.distance, 2);
-                Serial.println(" cm");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        erreursConsecutives = 0;
+
+        // Déterminer l'orientation
+        Orientation orientation;
+
+        // Position intermédiaire : on garde l'orientation précédente
+        if (!detecterOrientation(ax, ay, az, orientation)) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // Enviar solo si cambia la orientación // Envoyer uniquement si l'orientation change
+        if (premiereMesure ||
+            orientation != derniereOrientation) {
+
+            premiereMesure = false;
+            derniereOrientation = orientation;
+
+            MessageOrientation message;
+
+            message.orientation = orientation;
+            message.ax = ax;
+            message.ay = ay;
+            message.az = az;
+
+            // Envoyer dans la queue
+            if (xQueueSend( fileOrientations, &message, 0 ) == pdPASS) {
+                Serial.print("[CAPTEUR] Orientation : ");
+                Serial.println(nomOrientation(orientation));
+
             } else {
-                Serial.print("[DHT11] T=");
-                Serial.print(m.temperature, 1);
-                Serial.print(" C, H=");
-                Serial.print(m.humidite, 1);
-                Serial.println(" %");
+
+                nombreMessagesPerdus++;
+
+                Serial.println("[ERREUR] Queue pleine !");
+
+                Serial.print("[ERREUR] Messages perdus : ");
+                Serial.println(nombreMessagesPerdus);
             }
         }
 
-        // Read characters received on the serial port // Lire les caractères reçus sur le port série
-        while (Serial.available() > 0) {
-            char caractere = Serial.read();
-
-            if(caractere != '\n' && caractere != '\r'){
-                Serial.print(caractere);
-            }
-
-            if (caractere == '\n' || caractere == '\r') {
-                Serial.println();
-                commande.trim();
-
-                if (commande.equalsIgnoreCase("help")) {
-                    Serial.println("Commandes : csv, help");
-                } else if (commande.equalsIgnoreCase("csv")) {
-                    Serial.println( "temps_ms,capteur,distance_cm,temperature_C,humidite_pct" );
-
-                    size_t debut =(prochainePosition + 100 - nombreMesures) % 100;
-
-                    for (size_t i = 0; i < nombreMesures; i++) {
-                        const Mesure &r = historique[(debut + i) % 100];
-
-                        Serial.print(r.tempsMs);
-                        Serial.print(",");
-
-                        if (r.type == ULTRASON) {
-                            Serial.print("HC-SR04,");
-                            Serial.print(r.distance, 2);
-                            Serial.println(",,");
-                        } else {
-                            Serial.print("DHT11,,");
-                            Serial.print(r.temperature, 1);
-                            Serial.print(",");
-                            Serial.println(r.humidite, 1);
-                        }
-                    }
-                    Serial.println("# Fin CSV");
-                } else if (commande.length() > 0) {
-                    Serial.println("Commande inconnue. Tapez help.");
-                }
-
-                commande = "";
-            } else{
-                if(commande.length() < 20){
-                    commande = commande + caractere;
-                }
-            }
-        }
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
+
+// =====================================================
+// 11. GESTION DE LA RECONNEXION WIFI
+// =====================================================
+
+void gererWiFi() {
+
+// comprabado que el wifi esta conectado
+    if (WiFi.status() == WL_CONNECTED) {
+        return;
+    }
+
+    unsigned long maintenant = millis();
+
+    // Ne pas recommencer trop souvent
+    if (maintenant - derniereTentativeWiFi >= DELAI_WIFI) {
+
+        derniereTentativeWiFi = maintenant;
+        nombreTentativesWiFi++;
+
+        Serial.println("[Wi-Fi] Connexion perdue !"); // connexion perdida
+        Serial.println("[Wi-Fi] Nouvelle tentative..."); // nueva tentativa
+
+        WiFi.reconnect();
+
+        Serial.print("[Wi-Fi] Tentative numero : "); // tentativa numero ...
+        Serial.println(nombreTentativesWiFi);
+    }
+}
+
+// =====================================================
+// 12. GESTION DE LA RECONNEXION MQTT
+// =====================================================
+
+void gererMQTT() {
+
+    //  MQTT no puede funcionar sin Wi-Fi //MQTT ne peut pas fonctionner sans Wi-Fi
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+
+    //comprueba el estado de la conexión entre tu ESP32 y el broker MQTT
+    if (client.connected()) {
+        return;
+    }
+
+    unsigned long maintenant = millis();
+
+    // Attendre avant une nouvelle tentative
+    if (maintenant - derniereTentativeMQTT < DELAI_MQTT) {
+        return;
+    }
+
+    derniereTentativeMQTT = maintenant;
+    nombreTentativesMQTT++;
+
+    Serial.println("[MQTT] Connexion au broker...");
+
+    char clientId[40];
+
+    snprintf( clientId, sizeof(clientId), "ESP32-ADXL345-%lu", (unsigned long)millis() );
+
+    if (client.connect(clientId)) {
+
+        Serial.println("[MQTT] Connexion reussie !");
+
+    } else {
+
+        Serial.print("[MQTT] Echec. Code : ");
+        Serial.println(client.state());
+
+        Serial.print("[MQTT] Tentative numero : ");
+        Serial.println(nombreTentativesMQTT);
+    }
+}
+
+// =====================================================
+// 13. TACHE FREERTOS : COMMUNICATION MQTT
+// =====================================================
+
+void tacheMQTT(void *parameter) {
+
+    MessageOrientation message;
+
+    // Conserver le message en attente si publication échoue
+    bool messageEnAttente = false;
+
+    while (true) {
+
+        // Vérifier et gérer le Wi-Fi
+        gererWiFi();
+
+        // Vérifier et gérer MQTT
+        gererMQTT();
+
+        // Entretenir la connexion MQTT
+        if (client.connected()) {
+
+            client.loop();
+
+            // Récupérer un message uniquement si aucun
+            // autre message n'est en attente de publication
+            if (!messageEnAttente) {
+
+                if (xQueueReceive( fileOrientations, &message, pdMS_TO_TICKS(50) ) == pdPASS) {
+                    messageEnAttente = true;
+                }
+            }
+
+            // Publier le message en attente
+            if (messageEnAttente) {
+                const char* orientation =nomOrientation(message.orientation);
+
+                if (client.publish(topic, orientation)) {
+
+                    Serial.print("[MQTT] Message publie : ");
+                    Serial.println(orientation);
+
+                    messageEnAttente = false;
+
+                } else {
+
+                    nombreErreursPublication++;
+
+                    Serial.println("[MQTT] Echec de publication !"  );
+
+                    Serial.print( "[MQTT] Nombre d'echecs : " );
+
+                    Serial.println(nombreErreursPublication);
+                }
+            }
+
+        } else {
+
+            // Si MQTT est indisponible, les messages restent
+            // dans la queue, sauf si celle-ci arrive à saturation.
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// =====================================================
+// 14. SETUP
+// =====================================================
 
 void setup() {
+
     Serial.begin(115200);
-    Serial.setTimeout(50);
+
     delay(1000);
 
-    Serial.println("=== DEMARRAGE FREERTOS ===");
+    Serial.println();
+    Serial.println("====================================");
+    Serial.println(" ESP32 - ADXL345 - FREERTOS - MQTT");
+    Serial.println("====================================");
 
-    // Create a queue of 20 messages // Créer une queue de 20 messages 
-    fileMesures = xQueueCreate(20, sizeof(Mesure));
+    // Initialisation I2C
+    Wire.begin(SDA_PIN, SCL_PIN);
 
-    if (fileMesures == nullptr) {
-        Serial.println("ERROR: Unable to create the queue");
+    // Initialisation du capteur
+    Serial.println("[INIT] Initialisation ADXL345...");
+
+    if (!accel.begin()) {
+        Serial.println("[ERREUR] ADXL345 non detecte !" );
         while (true) {
             delay(1000);
         }
     }
 
-    // Créer les trois tâches // Create the three tasks
-    BaseType_t resultat1 = xTaskCreate( tacheUltrason, "TacheUltrason", 4096, nullptr, 1, nullptr );
+    accel.setRange(ADXL345_RANGE_2_G);
 
-    BaseType_t resultat2 = xTaskCreate( tacheDHT, "TacheDHT", 4096,nullptr, 1, nullptr );
+    Serial.println("[INIT] ADXL345 initialise !");
 
-    BaseType_t resultat3 = xTaskCreate( tacheCommunication, "TacheCommunication", 6144, nullptr, 1, nullptr );
+    // Initialisation Wi-Fi sans bloquer le setup
+    // inicializamos el wifi
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(ssid, password);
 
-    if (resultat1 != pdPASS ||resultat2 != pdPASS || resultat3 != pdPASS) // if not all tasks have been created correctly
-     {
-        Serial.println("ERREUR : creation d'une tache impossible");
+    Serial.println("[Wi-Fi] Demande de connexion envoyee.");
+
+    // Configuration MQTT
+    client.setServer(mqtt_server, mqtt_port);
+    client.setKeepAlive(30);
+    client.setSocketTimeout(3);
+
+    // Création de la queue
+    // create queue
+    fileOrientations = xQueueCreate( 5, sizeof(MessageOrientation));
+    if (fileOrientations == nullptr) {
+        Serial.println( "[ERREUR] Creation de la queue impossible !" );
+        while (true) {
+            delay(1000);
+        }
     }
+
+    Serial.println("[INIT] Queue creee avec succes !");
+
+    // Création de la tâche capteur
+    //Creación de la tarea del sensor
+    BaseType_t resultat1 = xTaskCreate(
+        tacheCapteur,
+        "TacheCapteur",
+        4096,
+        nullptr,
+        1,
+        nullptr
+    );
+
+    // Création de la tâche MQTT
+    // créacion de la tarea mqtt
+    BaseType_t resultat2 = xTaskCreate(
+        tacheMQTT,
+        "TacheMQTT",
+        6144,
+        nullptr,
+        1,
+        nullptr
+    );
+
+    // Vérifier la création des tâches
+    // comprobamos
+    if (resultat1 != pdPASS || resultat2 != pdPASS) {
+
+        Serial.println( "[ERREUR] Creation d'une tache impossible !" );
+
+        while (true) {
+            delay(1000);
+        }
+    }
+
+    Serial.println("[INIT] Les deux taches FreeRTOS sont creees !");
 }
 
+// =====================================================
+// 15. LOOP
+// =====================================================
+
 void loop() {
+
     vTaskDelay(pdMS_TO_TICKS(1000));
 }
